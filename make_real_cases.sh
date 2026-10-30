@@ -1,18 +1,20 @@
 #!/bin/bash
-# Builds demo_repo_8 .. demo_repo_10 from REAL bug-fix commits of open source projects.
+# Builds demos/demo_repo_8 .. demos/demo_repo_15 from REAL bug-fix commits of open source projects.
 # For each case: check out the commit just BEFORE the fix, then add only the test file
 # that the fix commit added, so the new test fails. Run from inside bugfix-agent:
 #   bash make_real_cases.sh
 set -e
 
 build() {  # build <folder> <github repo> <fix commit> <test files...>
-  local dir=$1 repo=$2 fix=$3; shift 3
-  rm -rf "$dir" "_tmp_$dir"
-  git clone -q --filter=blob:none "https://github.com/$repo.git" "_tmp_$dir"
-  git -C "_tmp_$dir" checkout -q "$fix~1"
-  for t in "$@"; do git -C "_tmp_$dir" show "$fix:$t" > "_tmp_$dir/$t"; done
-  rm -rf "_tmp_$dir/.git" "_tmp_$dir/.github" "_tmp_$dir/docs"
-  mv "_tmp_$dir" "$dir"
+  local name=$1 repo=$2 fix=$3; shift 3
+  local dir="demos/$name" tmp="_tmp_$name"
+  mkdir -p demos
+  rm -rf "$dir" "$tmp"
+  git clone -q --filter=blob:none "https://github.com/$repo.git" "$tmp"
+  git -C "$tmp" checkout -q "$fix~1"
+  for t in "$@"; do git -C "$tmp" show "$fix:$t" > "$tmp/$t"; done
+  rm -rf "$tmp/.git" "$tmp/.github" "$tmp/docs"
+  mv "$tmp" "$dir"
   echo "$repo @ $fix~1 (fix commit: $fix)" > "$dir/CASE_SOURCE.txt"
   echo "built $dir from $repo"
 }

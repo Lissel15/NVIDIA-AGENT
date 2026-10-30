@@ -2,7 +2,7 @@
 
 Usage (from the bugfix-agent folder, with the .venv active):
     python3 check_cases.py              # every case in cases.json
-    python3 check_cases.py demo_repo_14 demo_repo_15
+    python3 check_cases.py demo_repo_14 demo_repo_15     # with or without the demos/ prefix
 
 A bug case is OK when some tests fail for the right reason. A feature case is OK when the
 suite passes before the feature exists. Anything else is reported so you can fix the case
@@ -11,7 +11,7 @@ before spending tokens on it.
 import json, os, re, shutil, subprocess, sys, tempfile, time
 
 TIMEOUT = int(os.environ.get("TEST_TIMEOUT", "240"))   # same limit the agent uses
-only = set(sys.argv[1:])
+only = {a if a.startswith('demos/') else 'demos/' + a for a in sys.argv[1:]}
 cases = [c for c in json.load(open("cases.json")) if not only or c["repo"] in only]
 
 
