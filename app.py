@@ -7,8 +7,8 @@ import sys
 import gradio as gr
 
 EXAMPLES = sorted(
-    (d for d in glob.glob("demo_repo*") if os.path.isdir(d)),
-    key=lambda d: int(re.sub(r"\D", "", d) or 0),
+    (d for d in glob.glob("demos/demo_repo*") if os.path.isdir(d)),
+    key=lambda d: int(re.sub(r"\D", "", os.path.basename(d)) or 0),
 )
 
 try:

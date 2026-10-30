@@ -37,7 +37,7 @@ if sum(map(bool, (FEATURE, SCAFFOLD, OPTIMIZE, EXPLAIN))) > 1:
 if (SCAFFOLD or OPTIMIZE) and "MAX_ITERS" not in os.environ:
     MAX_ITERS = 80          # building a project / optimizing takes more steps than fixing a bug
 if CLI.repo is None and not SCAFFOLD:
-    CLI.repo = "demo_repo"
+    CLI.repo = "demos/demo_repo"
 if SCAFFOLD and not (CLI.repo and os.path.isdir(CLI.repo)):
     SRC = os.path.realpath(tempfile.mkdtemp(prefix="agent_src_"))   # empty starting point
 elif CLI.repo and os.path.isfile(CLI.repo):      # a single file instead of a repo
