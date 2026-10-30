@@ -154,6 +154,21 @@ Never write your API key in the code or in a public file; use the Space secret.
 
 Scaffold projects are written to `scaffold_output/<name>`, and their README always has a "Not verified" section.
 
+### Double-checking a fix (`verify_fix.py`)
+
+A fix can pass the tests and still be a hack. After a run you can check it with:
+
+```
+python3 verify_fix.py agent_output/<name>_fixed
+```
+
+It reads `changes.patch` and writes `verify_report.md` in that folder. It looks at two things:
+
+- Hardcoding: it warns if the patch adds an `if x == <value>` or uses a number copied from the test asserts (it skips 0, 1, 2 and `%` checks). A warning just means "look at this".
+- Flaky tests: it runs the suite 3 times and says if the results change.
+
+It is a basic check. It only looks at numbers and comparisons, so some tricks will get through.
+
 ## Configuration (environment variables)
 
 | Variable                 | Default                             | Meaning                                            |
@@ -257,6 +272,7 @@ These are single runs. The model is not deterministic, so a repeated run can giv
 agent.py             the agent (all modes)
 app.py               Gradio web demo (fix, explain and optimize tabs) that runs agent.py
 benchmark.py         runs every case and writes results.md
+verify_fix.py        independent check of a fix (hardcoding and flaky tests)
 check_cases.py       validates the cases without using the model
 cases.json           the 15 benchmark cases
 results.md           benchmark results
