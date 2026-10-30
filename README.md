@@ -104,9 +104,6 @@ python3 agent.py demos/demo_repo    # a tiny bug-fix example
 
 On Windows, activate the virtual environment with `.venv\Scripts\activate` instead of `source .venv/bin/activate`.
 
-### Example run
-
-`TODO: paste a short real output of a run here (the last lines with RESULT: SUCCESS, iterations and tokens), or add a screenshot/GIF to the repo and link it.`
 
 ## Understanding the results
 
