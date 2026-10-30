@@ -168,10 +168,10 @@ make_real_cases.sh   rebuilds the eight real-bug cases from upstream commits
 
 ## Team
 
-`David Miguel Medina Raymundo
+David Miguel Medina Raymundo
 Maria Fernanda Morales Hernández
 Lissel Erandi Flores Polvo
-Miguel Ángel Sarmiento Luna`
+Miguel Ángel Sarmiento Luna
 
 ## AI assistance and third-party code
 
