@@ -18,6 +18,7 @@ Built for the **Nebius x NVIDIA Global AI Hackathon**, track: **Coding & Agentic
 - [Modes](#modes)
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
+- [Web demo (Gradio)](#web-demo-gradio)
 - [Understanding the results](#understanding-the-results)
 - [Configuration](#configuration-environment-variables)
 - [Benchmark](#benchmark)
@@ -104,6 +105,44 @@ python3 agent.py demos/demo_repo    # a tiny bug-fix example
 
 On Windows, activate the virtual environment with `.venv\Scripts\activate` instead of `source .venv/bin/activate`.
 
+### Example run
+
+Real results from the agent are already in this repository:
+
+- **Bug fix / optimize:** [`agent_output/demo_repo_16_fixed`](agent_output/demo_repo_16_fixed), with the exact patch in `changes.patch`.
+- **Scaffold:** [`scaffold_output/create-a-fastapi-app-with-jwt-auth-regis`](scaffold_output/create-a-fastapi-app-with-jwt-auth-regis), a FastAPI + JWT project with 7 passing tests.
+- **Full benchmark:** [`results.md`](results.md), with iterations, tokens and time for each of the 15 cases.
+
+## Web demo (Gradio)
+
+`app.py` is a small [Gradio](https://www.gradio.app/) interface on top of `agent.py`, so you can try the agent without using the command line. It is also set up to run as a Hugging Face Space (it works with or without the `spaces` package).
+
+```
+pip install gradio
+python3 app.py
+```
+
+You need `NEBIUS_API_KEY` in your environment (or as a secret in the Space settings). Pick one of the example repos in `demos/` and use one of the tabs:
+
+| Tab       | What it does                                                                                      |
+|-----------|---------------------------------------------------------------------------------------------------|
+| Fix a bug | Runs the bug-fix mode and shows the live log, the agent summary and the diff of its changes.     |
+| Explain   | Runs the read-only explain mode; you can optionally type a question about the repo.              |
+| Optimize  | Runs the optimize mode and shows the live log, the agent summary and the diff.                   |
+
+To keep the public demo cheap and responsive, the web app uses lower limits than the command line: `MAX_ITERS=30` (fix) or `40` (optimize) and `TEST_TIMEOUT=60`. It queues up to 8 requests and runs one at a time. Feature and scaffold modes are only available from the command line.
+
+### Deploying to Hugging Face Spaces
+
+The public demo is meant to run as a Hugging Face Space:
+
+1. Create a new Space with the **Gradio** SDK.
+2. Push this repository to the Space (`app.py` must be at the root, together with `agent.py`, `requirements.txt` and the `demos/` folder).
+3. In the Space **Settings → Variables and secrets**, add a secret named `NEBIUS_API_KEY`.
+4. Make sure `requirements.txt` lists `openai`, `python-dotenv` and `pytest` (Gradio is installed by the Space itself).
+5. Copy the Space URL into the `Demo` line at the top of this README.
+
+Never write your API key in the code or in a public file; use the Space secret.
 
 ## Understanding the results
 
@@ -216,7 +255,7 @@ These are single runs. The model is not deterministic, so a repeated run can giv
 
 ```
 agent.py             the agent (all modes)
-app.py               TODO: one-line description of what app.py does
+app.py               Gradio web demo (fix, explain and optimize tabs) that runs agent.py
 benchmark.py         runs every case and writes results.md
 check_cases.py       validates the cases without using the model
 cases.json           the 15 benchmark cases
