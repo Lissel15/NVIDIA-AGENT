@@ -1,4 +1,5 @@
-import os, re, sys, json, shutil, subprocess, tempfile, difflib, hashlib, argparse, ast
+import os, re, sys, json, shutil, subprocess, tempfile, difflib, hashlib, argparse, ast, math, copy
+from collections import Counter
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -16,33 +17,41 @@ AUTO_TEST = os.environ.get("AUTO_TEST", "1") == "1"
 ESCALATE_MODEL = os.environ.get("AGENT_ESCALATION_MODEL")   # optional stronger model, e.g. Ultra
 STUCK_AFTER = int(os.environ.get("STUCK_AFTER", "6"))       # iterations without progress before escalating
 READ_LIMIT = int(os.environ.get("READ_LIMIT", "6"))         # read-only calls in a row before only action tools are offered
+AGENT_LANG = os.environ.get("AGENT_LANG", "English")        # language of the first overview in explain mode
 
 ap = argparse.ArgumentParser()
 ap.add_argument("repo", nargs="?", default=None)
 ap.add_argument("--feature", help="Description of a new feature to implement")
 ap.add_argument("--scaffold", help="Natural-language spec of a whole module/app to build from scratch")
-ap.add_argument("--out", help="Where to save the generated project in scaffold mode "
-                              "(default: scaffold_output/<name>)")
+ap.add_argument("--optimize", action="store_true",
+                help="Fix bugs, clean up and reduce the algorithmic complexity of the code")
 ap.add_argument("--explain", action="store_true",
                 help="Explain the repo and let you ask questions about it (read-only)")
+ap.add_argument("--out", help="Where to save the result "
+                              "(default: scaffold_output/<name> in scaffold mode, "
+                              "agent_output/<repo>_fixed otherwise)")
 CLI = ap.parse_args()
-FEATURE, SCAFFOLD = CLI.feature, CLI.scaffold
-EXPLAIN = CLI.explain
-if sum(map(bool, (FEATURE, SCAFFOLD, EXPLAIN))) > 1:
-    sys.exit("Use only one of --feature, --scaffold or --explain.")
-if SCAFFOLD and "MAX_ITERS" not in os.environ:
-    MAX_ITERS = 80          # building a project takes more steps than fixing a bug
+FEATURE, SCAFFOLD, OPTIMIZE, EXPLAIN = CLI.feature, CLI.scaffold, CLI.optimize, CLI.explain
+if sum(map(bool, (FEATURE, SCAFFOLD, OPTIMIZE, EXPLAIN))) > 1:
+    sys.exit("Use only one of --feature, --scaffold, --optimize or --explain.")
+if (SCAFFOLD or OPTIMIZE) and "MAX_ITERS" not in os.environ:
+    MAX_ITERS = 80          # building a project / optimizing takes more steps than fixing a bug
 if CLI.repo is None and not SCAFFOLD:
     CLI.repo = "demo_repo"
 if SCAFFOLD and not (CLI.repo and os.path.isdir(CLI.repo)):
     SRC = os.path.realpath(tempfile.mkdtemp(prefix="agent_src_"))   # empty starting point
+elif CLI.repo and os.path.isfile(CLI.repo):      # a single file instead of a repo
+    SRC = os.path.realpath(tempfile.mkdtemp(prefix="agent_src_"))
+    shutil.copy(CLI.repo, SRC)
 else:
     SRC = CLI.repo
 
 WORK = os.path.realpath(tempfile.mkdtemp(prefix="agent_"))
 shutil.copytree(SRC, WORK, dirs_exist_ok=True,
                 ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"))
-print(f"[agent] mode: {'scaffold (new project)' if SCAFFOLD else 'explain (repo Q&A)' if EXPLAIN else 'new feature' if FEATURE else 'bug fix'}")
+MODE_NAME = ('scaffold (new project)' if SCAFFOLD else 'optimize' if OPTIMIZE
+             else 'explain (repo Q&A)' if EXPLAIN else 'new feature' if FEATURE else 'bug fix')
+print(f"[agent] mode: {MODE_NAME}")
 print(f"[agent] working on a copy: {WORK}")
 if not ESCALATE_MODEL and not EXPLAIN:
     print("[agent] note: AGENT_ESCALATION_MODEL is not set, so the agent will never escalate to a stronger model.")
@@ -241,7 +250,7 @@ def is_project_module(mod):
     for base in (WORK, os.path.join(WORK, "src")):
         if os.path.exists(os.path.join(base, mod + ".py")) or os.path.isdir(os.path.join(base, mod)):
             return True
-    return bool(SCAFFOLD or FEATURE) and mod not in sys.stdlib_module_names and mod not in NOT_PROJECT
+    return bool(SCAFFOLD or FEATURE or OPTIMIZE) and mod not in sys.stdlib_module_names and mod not in NOT_PROJECT
 
 
 def trivial_test_reason(content):
@@ -479,6 +488,349 @@ def run_tests(target=None):
         return f"FAILED: timed out after {TEST_TIMEOUT}s"
 
 
+# ---------------------------------------------------------------- optimize mode
+LOOP_STMTS = (ast.For, ast.AsyncFor, ast.While)
+COMPS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+PURE_CALLS = {"sum", "min", "max", "sorted", "set", "list", "tuple", "any", "all", "dict"}
+SLOW_METHODS = {"index", "count", "remove", "sort"}      # O(n) per call on a list
+FINDING_ORDER = ["complexity", "repeated work", "duplicate", "dead code", "unused import", "unused variable"]
+ANALYZED = set()      # files analysed with analyze_code
+BENCH = {}            # (setup, stmt) -> baseline measurement
+NO_TESTS = False      # True when the repo had no tests at the start (optimize mode)
+
+
+def _py_files(root):
+    out = []
+    for r, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        out += [os.path.join(r, f) for f in files if f.endswith(".py")]
+    return sorted(out)
+
+
+def _names(node):
+    """Counter of every name a piece of code refers to (variables, attributes, imports, short strings)."""
+    c = Counter()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            c[n.id] += 1
+        elif isinstance(n, ast.Attribute):
+            c[n.attr] += 1
+        elif isinstance(n, ast.alias):
+            c[n.name.split(".")[-1]] += 1
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) < 60:
+            c[n.value] += 1
+    return c
+
+
+def _dead_defs(tree, total):
+    out = []
+    for n in ast.walk(tree):
+        if isinstance(n, FUNC_NODES + (ast.ClassDef,)):
+            if n.name.startswith(("__", "test")) or n.name == "main" or n.decorator_list:
+                continue
+            if total[n.name] - _names(n)[n.name] <= 0:     # references inside itself (recursion) don't count
+                out.append((n.lineno, n.name))
+    return sorted(out)
+
+
+def _unused_imports(tree):
+    loaded = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    strings = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    out = []
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            if isinstance(n, ast.ImportFrom) and n.module == "__future__":
+                continue
+            for a in n.names:
+                bound = a.asname or a.name.split(".")[0]
+                if a.name != "*" and bound not in loaded and bound not in strings:
+                    out.append((n.lineno, bound))
+    return out
+
+
+def _unused_locals(fn):
+    stores, loads, special = {}, set(), set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Name):
+            if isinstance(n.ctx, ast.Store):
+                stores.setdefault(n.id, n.lineno)
+            else:
+                loads.add(n.id)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            special |= set(n.names)
+    return sorted((ln, v) for v, ln in stores.items()
+                  if v not in loads and v not in special and not v.startswith("_"))
+
+
+def _repeated_calls(fn):
+    count, first = Counter(), {}
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in PURE_CALLS:
+            k = ast.dump(n)
+            count[k] += 1
+            first.setdefault(k, n)
+    return [(first[k].lineno, ast.unparse(first[k]), c) for k, c in count.items() if c >= 2]
+
+
+class _Rename(ast.NodeTransformer):
+    """Rename local variables to v0, v1... so two functions that differ only in names look the same."""
+    def __init__(self, local):
+        self.local, self.map = local, {}
+
+    def _new(self, name):
+        return self.map.setdefault(name, f"v{len(self.map)}") if name in self.local else name
+
+    def visit_Name(self, node):
+        node.id = self._new(node.id)
+        return node
+
+    def visit_arg(self, node):
+        node.arg = self._new(node.arg)
+        return node
+
+
+def _fingerprint(fn):
+    f = copy.deepcopy(fn)
+    f.name, f.decorator_list, f.returns = "f", [], None
+    if (f.body and isinstance(f.body[0], ast.Expr) and isinstance(f.body[0].value, ast.Constant)
+            and isinstance(f.body[0].value.value, str)):
+        f.body = f.body[1:]                                   # drop the docstring
+    local = ({a.arg for a in ast.walk(f.args) if isinstance(a, ast.arg)} |
+             {n.id for n in ast.walk(f) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)})
+    return ast.dump(_Rename(local).visit(f))
+
+
+def _depth(node, d=0):
+    """Deepest loop nesting inside 'node' (nested function definitions are analysed on their own)."""
+    if isinstance(node, LOOP_STMTS):
+        head = [node.test] if isinstance(node, ast.While) else [node.iter]
+        parts = [(c, d) for c in head] + [(c, d + 1) for c in node.body + node.orelse]
+        best = d + 1
+    else:
+        extra = len(node.generators) if isinstance(node, COMPS) else 0
+        parts = [(c, d + extra) for c in ast.iter_child_nodes(node)]
+        best = d + extra
+    for child, dd in parts:
+        if not isinstance(child, FUNC_NODES):
+            best = max(best, _depth(child, dd))
+    return best
+
+
+def _loop_hits(fn):
+    """Operations inside loops that cost O(n) each, which turns the loop into O(n^2)."""
+    hits = set()
+    for loop in ast.walk(fn):
+        if isinstance(loop, LOOP_STMTS):
+            parts = loop.body + loop.orelse
+        elif isinstance(loop, COMPS):
+            parts = [loop]
+        else:
+            continue
+        for part in parts:
+            for n in ast.walk(part):
+                msg, line = None, getattr(n, "lineno", loop.lineno)
+                if isinstance(n, ast.Compare):
+                    for op, comp in zip(n.ops, n.comparators):
+                        if isinstance(op, (ast.In, ast.NotIn)) and not isinstance(comp, (ast.Set, ast.Dict, ast.Constant)):
+                            msg = "'in' test inside a loop: O(n) per test if the right side is a list or string (use a set or dict)"
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                    if n.func.attr in SLOW_METHODS:
+                        msg = f".{n.func.attr}() inside a loop is O(n) per call"
+                    elif (n.func.attr in ("pop", "insert") and n.args
+                          and isinstance(n.args[0], ast.Constant) and n.args[0].value == 0):
+                        msg = f".{n.func.attr}(0) inside a loop is O(n) per call (use collections.deque)"
+                elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                      and n.func.id in ("sorted", "min", "max", "sum") and len(n.args) == 1):
+                    msg = f"{n.func.id}() inside a loop re-scans the data on every iteration: hoist or maintain it incrementally"
+                elif (isinstance(n, ast.AugAssign) and isinstance(n.op, ast.Add)
+                      and (isinstance(n.value, ast.JoinedStr)
+                           or (isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)))):
+                    msg = "string concatenation with += inside a loop (collect the parts and use ''.join)"
+                elif isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Slice):
+                    msg = "slice inside a loop copies the data on every iteration (use indexes)"
+                if msg:
+                    hits.add((line, msg))
+    return sorted(hits)
+
+
+def _self_calls(fn):
+    calls = sum(1 for n in ast.walk(fn) if isinstance(n, ast.Call) and (
+        (isinstance(n.func, ast.Name) and n.func.id == fn.name) or
+        (isinstance(n.func, ast.Attribute) and n.func.attr == fn.name
+         and isinstance(n.func.value, ast.Name) and n.func.value.id in ("self", "cls"))))
+    cached = any("cache" in ast.dump(d) or "memo" in ast.dump(d).lower() for d in fn.decorator_list)
+    return calls, cached
+
+
+def analyze_code(path="."):
+    """Heuristic static report: complexity hotspots, dead code, unused imports/variables, duplicates."""
+    full = safe(path)
+    parsed, total = {}, Counter()
+    for p in _py_files(WORK):
+        try:
+            with open(p, errors="ignore") as f:
+                parsed[p] = ast.parse(f.read())
+        except SyntaxError:
+            continue
+        total.update(_names(parsed[p]))
+    targets = [full] if os.path.isfile(full) else [
+        p for p in _py_files(full) if not is_protected(os.path.relpath(p, WORK))]
+    if not targets:
+        return "No Python files to analyse there."
+
+    twins = {}                      # functions with the same body, across the whole repo
+    for p, tree in parsed.items():
+        if is_protected(os.path.relpath(p, WORK)):
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, FUNC_NODES) and sum(1 for _ in ast.walk(n)) >= 25:
+                twins.setdefault(_fingerprint(n), []).append(f"{os.path.relpath(p, WORK)}:{n.lineno} {n.name}()")
+
+    items, seen_local, seen_twins = [], set(), set()
+    for p in targets:
+        rel = os.path.relpath(p, WORK)
+        tree = parsed.get(p)
+        if tree is None:
+            items.append(("complexity", f"{rel}: cannot be parsed (syntax error): fix it first"))
+            continue
+        ANALYZED.add(rel)
+        for ln, name in _dead_defs(tree, total):
+            items.append(("dead code", f"{rel}:{ln} '{name}' is never referenced anywhere in the repo "
+                                       "(check it is not public API before deleting)"))
+        if os.path.basename(p) != "__init__.py":
+            for ln, name in _unused_imports(tree):
+                items.append(("unused import", f"{rel}:{ln} '{name}'"))
+        for fn in (n for n in ast.walk(tree) if isinstance(n, FUNC_NODES)):
+            for ln, var in _unused_locals(fn):
+                if (rel, ln, var) not in seen_local:
+                    seen_local.add((rel, ln, var))
+                    items.append(("unused variable", f"{rel}:{ln} '{var}' in {fn.name}()"))
+            for ln, code, c in _repeated_calls(fn):
+                items.append(("repeated work", f"{rel}:{ln} {code} appears {c} times in {fn.name}(): compute it once"))
+            depth = max([_depth(s) for s in fn.body if not isinstance(s, FUNC_NODES)] or [0])
+            if depth >= 2:
+                items.append(("complexity", f"{rel}:{fn.lineno} {fn.name}() has loops nested {depth} deep "
+                                            f"(likely O(n^{depth})): is there a linear or n log n approach?"))
+            for ln, msg in _loop_hits(fn):
+                items.append(("complexity", f"{rel}:{ln} in {fn.name}(): {msg}"))
+            calls, cached = _self_calls(fn)
+            if calls >= 2 and not cached:
+                items.append(("complexity", f"{rel}:{fn.lineno} {fn.name}() calls itself {calls} times without "
+                                            "memoization: if subproblems overlap this is exponential (functools.cache / DP)"))
+        for group in twins.values():
+            if len(group) > 1 and id(group) not in seen_twins and any(g.startswith(rel + ":") for g in group):
+                seen_twins.add(id(group))
+                items.append(("duplicate", "same logic in: " + ", ".join(group) + " (merge them)"))
+
+    if not items:
+        return "Static analysis found nothing. It is heuristic: still read the hot paths yourself."
+    items.sort(key=lambda it: FINDING_ORDER.index(it[0]))
+    shown = [f"[{tag}] {text}" for tag, text in items[:40]]
+    more = f"\n({len(items) - 40} more findings not shown)" if len(items) > 40 else ""
+    return (f"{len(items)} findings (heuristic: verify each one by reading the code before changing it)\n"
+            + "\n".join(shown) + more)[:MAX_OUT]
+
+
+BENCH_RUNNER = r'''
+import sys, json, time
+sizes = json.loads(sys.argv[1])
+setup_c = compile(open(sys.argv[2]).read(), "<setup>", "exec")
+stmt_c = compile(open(sys.argv[3]).read(), "<stmt>", "exec")
+for n in sizes:
+    best, spent = None, 0.0
+    for _ in range(3):
+        ns = {"n": n, "__name__": "__bench__"}
+        exec(setup_c, ns)
+        t0 = time.perf_counter()
+        exec(stmt_c, ns)
+        dt = time.perf_counter() - t0
+        best = dt if best is None else min(best, dt)
+        spent += dt
+        if spent > 1.5:
+            break
+    print(json.dumps([n, best]), flush=True)
+'''
+
+
+def _growth_label(slope):
+    if slope < 0.25:
+        return "about constant or logarithmic"
+    if slope < 1.25:
+        return "about linear (or n log n)"
+    if slope < 1.75:
+        return "superlinear (between n log n and quadratic)"
+    if slope < 2.5:
+        return "about quadratic"
+    return "cubic or worse (or exponential)"
+
+
+def benchmark(setup, stmt, sizes=None):
+    """Time 'stmt' for growing sizes of 'n' and estimate how the running time grows."""
+    try:
+        sizes = [int(s) for s in (sizes or [1000, 2000, 4000, 8000])]
+    except (TypeError, ValueError):
+        return "ERROR: sizes must be a list of integers."
+    if (not 2 <= len(sizes) <= 6 or sizes != sorted(sizes) or len(set(sizes)) != len(sizes)
+            or any(s < 1 or s > 5_000_000 for s in sizes)):
+        return "ERROR: give 2 to 6 increasing sizes between 1 and 5,000,000 (ideally doubling: 1000, 2000, 4000, 8000)."
+    with tempfile.TemporaryDirectory(prefix="bench_") as tmp:
+        paths = {}
+        for name, text in (("runner.py", BENCH_RUNNER), ("setup.py", setup), ("stmt.py", stmt)):
+            paths[name] = os.path.join(tmp, name)
+            with open(paths[name], "w") as f:
+                f.write(text)
+        cmd = [sys.executable, paths["runner.py"], json.dumps(sizes), paths["setup.py"], paths["stmt.py"]]
+        try:
+            r = subprocess.run(cmd, cwd=WORK, capture_output=True, text=True,
+                               timeout=TEST_TIMEOUT, env=clean_env())
+            stdout, err, timed_out = r.stdout, r.stderr, False
+        except subprocess.TimeoutExpired as e:
+            raw = e.stdout or b""
+            stdout = raw.decode(errors="ignore") if isinstance(raw, bytes) else raw
+            err, timed_out = "", True
+    rows = []
+    for line in stdout.splitlines():
+        try:
+            n, t = json.loads(line)
+            rows.append((n, t))
+        except (ValueError, TypeError):
+            continue
+    if not rows:
+        return ("ERROR: the benchmark produced no result "
+                + (f"(timed out after {TEST_TIMEOUT}s: use smaller sizes)." if timed_out
+                   else "(your setup or stmt failed):\n" + err[-1200:]))
+    lines = [f"n={n:>9,}  {t * 1000:10.2f} ms" for n, t in rows]
+    if timed_out:
+        lines.append(f"(timed out after {TEST_TIMEOUT}s: the next size was too slow, which already says a lot)")
+    slope = None
+    if len(rows) >= 2 and rows[-1][1] >= 0.005:
+        (n1, t1), (n2, t2) = rows[-2], rows[-1]
+        slope = math.log(t2 / max(t1, 1e-9)) / math.log(n2 / n1)
+        lines.append(f"growth between the last two sizes: ~n^{slope:.2f} -> {_growth_label(slope)}")
+    elif len(rows) >= 2:
+        lines.append("too fast to measure the growth reliably: use larger sizes")
+    key = (setup, stmt)
+    cur = {"n": rows[-1][0], "t": rows[-1][1], "slope": slope}
+    base = BENCH.get(key)
+    if base is None:
+        BENCH[key] = dict(cur, compared=False)
+        lines.append("Baseline saved. After changing the code, call benchmark again with the SAME "
+                     "setup, stmt and sizes to compare.")
+    else:
+        base["compared"] = True
+        if base["n"] == cur["n"] and cur["t"] > 0:
+            ratio = base["t"] / cur["t"]
+            lines.append(f"vs baseline at n={cur['n']:,}: {base['t'] * 1000:.2f} ms -> {cur['t'] * 1000:.2f} ms "
+                         + (f"({ratio:.1f}x faster)" if ratio >= 1 else f"({1 / ratio:.1f}x SLOWER)"))
+            if base["slope"] is not None and slope is not None:
+                lines.append(f"growth: ~n^{base['slope']:.2f} before -> ~n^{slope:.2f} now")
+        else:
+            lines.append("the sizes differ from the baseline, so the results are not directly comparable.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- tool schema
 def obj(props, req):
     return {"type": "object", "properties": props, "required": req}
 
@@ -549,13 +901,33 @@ if SCAFFOLD:    # extra tools, only offered when building a project from scratch
     FUNCS.update({"submit_plan": submit_plan, "write_file": write_file,
                   "install_requirements": install_requirements})
 
+if OPTIMIZE:    # extra tools, only offered in optimize mode
+    TOOLS += [
+        {"type": "function", "function": {"name": "analyze_code",
+            "description": "Heuristic static analysis of a file or folder (default: the whole repo). Reports "
+                           "complexity hotspots (nested loops, O(n) operations inside loops, recursion without "
+                           "memoization), dead code, unused imports and variables, duplicated functions and "
+                           "repeated computations. Findings are hints: verify each one before changing anything.",
+            "parameters": obj({"path": S}, [])}},
+        {"type": "function", "function": {"name": "benchmark",
+            "description": "Measure how the running time grows. 'setup' is Python code that builds the input "
+                           "using the variable n (it can import the project's modules); 'stmt' is the code to "
+                           "time (e.g. 'result = my_function(data)'). It runs for each size in 'sizes' "
+                           "(default 1000, 2000, 4000, 8000) and estimates the growth (linear, quadratic...). "
+                           "Call it BEFORE changing an algorithm and again with the SAME setup and stmt AFTER, "
+                           "to compare.",
+            "parameters": obj({"setup": S, "stmt": S, "sizes": {"type": "array", "items": I}},
+                              ["setup", "stmt"])}},
+    ]
+    FUNCS.update({"analyze_code": analyze_code, "benchmark": benchmark})
+
 TOOL_PARAMS = {t["function"]["name"]: (list(t["function"]["parameters"]["properties"]),
                                       t["function"]["parameters"]["required"]) for t in TOOLS}
 ACTION_TOOLS = [t for t in TOOLS if t["function"]["name"] in
-                ("edit_file", "edit_lines", "add_test", "run_tests",
+                ("edit_file", "edit_lines", "add_test", "run_tests", "benchmark",
                  "submit_plan", "write_file", "install_requirements")]
 SCAFFOLD_GATED = ("write_file", "add_test", "install_requirements", "edit_file", "edit_lines")
-READ_ONLY = ("read_file", "read_symbol", "search_code", "list_files")
+READ_ONLY = ("read_file", "read_symbol", "search_code", "list_files", "analyze_code")
 EDIT_TOOLS = ("edit_file", "edit_lines")
 EDITS = 0          # number of successful edits so far
 SEEN = {}          # read-only calls already made, and the EDITS value when they were made
@@ -580,9 +952,11 @@ def snapshot():
 
 
 def note_state(fails):
-    """Remember the state with the fewest failing tests, so we can go back to it."""
+    """Remember the best state. When optimizing, a state with equal failures but more cleanup is also kept."""
     global BEST_FAILS, BEST_FILES
-    if fails is not None and (BEST_FAILS is None or fails < BEST_FAILS):
+    if fails is None:
+        return
+    if BEST_FAILS is None or fails < BEST_FAILS or (OPTIMIZE and fails == BEST_FAILS):
         BEST_FAILS, BEST_FILES = fails, snapshot()
 
 
@@ -679,6 +1053,11 @@ def run_tool(name, args):
     if SCAFFOLD and PLAN is None and name in SCAFFOLD_GATED:
         return "ERROR: call submit_plan first: the plan must come before any file is written."
 
+    if OPTIMIZE and name in EDIT_TOOLS and NO_TESTS and not NEW_TESTS:
+        return ("ERROR: this repo has no tests. Before changing any code, write characterization tests "
+                "with add_test that pin down the CURRENT behavior (normal and edge cases), so the "
+                "optimization can be verified.")
+
     # Block reads that give no new information (same call, or lines already shown).
     key = (name, json.dumps(args, sort_keys=True))
     repeated = name in READ_ONLY and name != "read_file" and SEEN.get(key) == EDITS
@@ -715,6 +1094,11 @@ def run_tool(name, args):
         EDITS += 1
         FAILS, FAIL_NAMES = None, set()
         BEST_FAILS, BEST_FILES = None, {}      # the test suite changed: old counts are not comparable
+        if OPTIMIZE and AUTO_TEST:      # new baseline, so later edits can be checked (and undone) against it
+            tests = run_tests()
+            FAILS, FAIL_NAMES = count_failures(tests), failing_names(tests)
+            note_state(FAILS)
+            result = f"{result}\n\n[tests re-run automatically]\n{brief(tests)}"
     if ok and name == "write_file":
         EDITS += 1
         if "rewrote" in str(result) and NEW_TESTS and AUTO_TEST and "WARNING" not in str(result):
@@ -813,12 +1197,55 @@ SYSTEM_SCAFFOLD = (
     "Keep files small and focused. For async code, use pytest-asyncio or FastAPI's TestClient."
 )
 
-# ---------------------------------------------------------------------------
-# EXPLAIN MODE: gives the user context about the repo and lets them ask questions.
+SYSTEM_OPTIMIZE = (
+    "You are a code optimization agent. The code must end up CORRECT, CLEAN and with the lowest "
+    "algorithmic complexity you can reach, WITHOUT changing its behavior. Work through these phases "
+    "in order, even if the user did not ask for each of them. "
+    "PHASE 0 - UNDERSTAND AND PROTECT. Read the code (list_files, read_symbol, read_file, search_code). "
+    "Identify the public functions and what each one is supposed to do. Your safety net is the tests: "
+    "if the repo has no tests, or the functions you will touch are not covered, write tests FIRST with "
+    "add_test that pin down the current correct behavior: normal cases, edge cases (empty input, one "
+    "element, duplicates, negatives, very large values) and errors. For every function whose algorithm "
+    "you may change, also write a randomized differential test: keep a naive reference implementation "
+    "INSIDE the test file and compare both on many random inputs generated with a fixed seed. "
+    "PHASE 1 - BUGS. Look for bugs yourself: off-by-one errors, wrong handling of empty or single-element "
+    "input, mutable default arguments, mutating the caller's input by accident, bare 'except', wrong "
+    "comparisons, integer vs float division, unreachable branches. If tests already fail, fix the CODE "
+    "(never the tests). For a suspected bug that no test covers, write a test that shows it with add_test, "
+    "confirm it FAILS, then fix it. If something is ambiguous (it may be intended behavior), do not change "
+    "it: mention it in your summary. "
+    "PHASE 2 - CLEAN UP. Call analyze_code. For every finding, read the code and decide: remove functions "
+    "that nothing calls (but keep anything that is public API: used by tests, the README or other "
+    "modules), remove unused imports and variables, merge duplicated functions, compute repeated "
+    "expressions once, simplify needlessly verbose code. One change at a time, and check the test status "
+    "after each one. "
+    "PHASE 3 - REDUCE THE COMPLEXITY (the most important phase). For each function on a hot path, "
+    "state in one sentence its current time and space complexity, the best one achievable, and the "
+    "approach that gets there: hash set/dict lookups instead of list scans, sorting plus two pointers, "
+    "binary search (bisect), heap, prefix sums, sliding window, memoization or dynamic programming, "
+    "collections.deque, ''.join instead of repeated concatenation, generators instead of intermediate "
+    "lists, a single pass instead of several. Measure BEFORE with benchmark (setup builds the input from "
+    "n, stmt calls the function), make the change, then call benchmark again with the SAME setup, stmt and "
+    "sizes to prove the improvement. Use analyze_code's complexity findings as leads, but only act on "
+    "what you have confirmed by reading the code. If a function is already optimal, say so and leave it "
+    "alone: never rewrite code just to rewrite it, and never trade readability for micro-optimizations "
+    "that do not change the complexity. "
+    "RULES. Never modify existing tests, never weaken or delete a test to make it pass, never write "
+    "placeholder or trivial tests, and never hardcode expected values or special-case inputs. Preserve "
+    "behavior exactly: signatures, return types, output order, stability of sorting, tie-breaking, "
+    "exceptions raised, and whether the input is mutated. After EVERY edit you are told which tests pass "
+    "and which fail; edits that create a syntax error or make the tests worse are undone automatically. "
+    "Do not keep reading: once you understand a function, act. Never finish while tests fail. "
+    "FINISH with a short summary in English with four parts: bugs fixed, cleanup done, complexity "
+    "before -> after for each function (with the measured benchmark numbers), and what you left "
+    "untouched and why."
+)
+
+# ---------------------------------------------------------------- explain mode
+# Gives the user context about the repo and lets them ask questions.
 # Read-only: it never edits files and never runs tests.
-# ---------------------------------------------------------------------------
 EXPLAIN_TOOLS = [t for t in TOOLS if t["function"]["name"] in READ_ONLY]
-AGENT_LANG = os.environ.get("AGENT_LANG", "English")
+EXPLAIN_NAMES = {t["function"]["name"] for t in EXPLAIN_TOOLS}
 
 SYSTEM_EXPLAIN = (
     "You are a code guide. You help a person understand a repository: what it does, how it is "
@@ -892,7 +1319,7 @@ def explain_mode():
                                             for tc in msg.tool_calls]})
             for tc in msg.tool_calls:
                 try:
-                    if tc.function.name not in READ_ONLY:
+                    if tc.function.name not in EXPLAIN_NAMES:
                         raise ValueError("only read-only tools are available")
                     args = normalize(json.loads(tc.function.arguments or "{}"))
                     result = FUNCS[tc.function.name](**args)   # direct call: re-reading is allowed
@@ -919,6 +1346,7 @@ if EXPLAIN:
     explain_mode()
     sys.exit(0)
 
+# ---------------------------------------------------------------- main loop
 if SCAFFOLD:
     first = "(no tests yet: this is a new project)"
     print("[agent] scaffold mode: starting without tests; the plan comes first")
@@ -930,10 +1358,13 @@ else:
         print("RESULT: ERROR\nThe repository is empty: there is nothing to fix. "
               "To build something from scratch use --scaffold \"<specification>\".")
         sys.exit(2)
-    if not FEATURE and "no tests ran" in first:
+    if not (FEATURE or OPTIMIZE) and "no tests ran" in first:
         print("RESULT: ERROR\nNo tests were collected, so there is no failing test to fix. "
               "The case is empty or broken; check it with: python3 -m pytest <repo>")
         sys.exit(2)
+    NO_TESTS = OPTIMIZE and "no tests ran" in first
+    if NO_TESTS:
+        print("[agent] optimize mode: the repo has no tests, so the agent must write characterization tests first")
 FAILS = count_failures(first)
 FAIL_NAMES = failing_names(first)
 note_state(FAILS)
@@ -949,6 +1380,14 @@ elif FEATURE:
     system = SYSTEM_FEATURE
     user = (f"Feature request: {FEATURE}\n\n"
             f"Initial test status:\n{first}")
+elif OPTIMIZE:
+    system = SYSTEM_OPTIMIZE
+    user = (f"Optimize this code following the phases.\n\nFiles:\n{list_files()}\n\n"
+            f"Initial test status:\n{first}")
+    if not first.startswith("PASSED") and not NO_TESTS:
+        user += f"\n\nCode around the failing lines:\n{failure_context(first)}"
+    if NO_TESTS:
+        user += "\n\nThere are NO tests: write characterization tests before changing anything."
 else:
     if first.startswith("PASSED"):
         sys.exit("The tests already pass, so there is nothing to fix.")
@@ -964,7 +1403,7 @@ for i in range(1, MAX_ITERS + 1):
     print(f"\n=== Iteration {i}/{MAX_ITERS} ===")
     if PROGRESS != seen_progress:
         seen_progress, last_progress_iter = PROGRESS, i - 1
-    if SCAFFOLD and EDITS != seen_edits:        # writing new files is progress too
+    if (SCAFFOLD or OPTIMIZE) and EDITS != seen_edits:        # edits are progress too
         seen_edits, last_progress_iter = EDITS, i - 1
     if ESCALATE_MODEL and model != ESCALATE_MODEL and i - last_progress_iter >= STUCK_AFTER:
         model = ESCALATE_MODEL
@@ -1018,6 +1457,7 @@ for i in range(1, MAX_ITERS + 1):
 else:
     print("\n[agent] reached the maximum number of iterations.")
 
+# ---------------------------------------------------------------- final verification
 print("\n=== FINAL VERIFICATION ===")
 final = run_tests()
 if (not SCAFFOLD and not final.startswith("PASSED") and BEST_FAILS is not None
@@ -1031,9 +1471,10 @@ print(final)
 tampered = [r for r, h in ORIGINAL.items()
             if not os.path.exists(os.path.join(WORK, r)) or sha(os.path.join(WORK, r)) != h]
 print("Original tests intact:", "YES" if not tampered else f"NO, modified: {tampered}")
-if FEATURE or SCAFFOLD:
+if FEATURE or SCAFFOLD or OPTIMIZE:
     print("New tests added:", sorted(NEW_TESTS) or "NONE")
-ok = final.startswith("PASSED") and not tampered and (not (FEATURE or SCAFFOLD) or bool(NEW_TESTS))
+needs_new = FEATURE or SCAFFOLD or (OPTIMIZE and NO_TESTS)
+ok = final.startswith("PASSED") and not tampered and (not needs_new or bool(NEW_TESTS))
 
 SKIP_PATTERN = re.compile(r"pytest\.(mark\.(skip|skipif|xfail)|skip\(|xfail\()|collect_ignore|"
                           r"importorskip|--deselect|--ignore|pytest_collection_modifyitems|\bunittest\.skip")
@@ -1058,6 +1499,22 @@ if SCAFFOLD:
     print("Files created:", len([c for c in CREATED | NEW_TESTS]))
     print("Checks:", "all passed" if not problems else "; ".join(problems))
     ok = ok and not problems
+
+if OPTIMIZE:
+    problems = []
+    if not ANALYZED:
+        problems.append("analyze_code was never run (the cleanup phase was skipped)")
+    for rel in sorted(NEW_TESTS):
+        with open(os.path.join(WORK, rel), errors="ignore") as fh:
+            if SKIP_PATTERN.search(fh.read()):
+                problems.append(f"{rel} skips or ignores tests")
+    if re.search(r"\b\d+ skipped\b", final):
+        problems.append("some tests were skipped, so they verify nothing")
+    compared = sum(1 for b in BENCH.values() if b["compared"])
+    print(f"Benchmarks: {len(BENCH)} measured, {compared} compared against their baseline")
+    print("Checks:", "all passed" if not problems else "; ".join(problems))
+    ok = ok and not problems
+
 print("RESULT:", "SUCCESS" if ok else "REVIEW")
 
 if SCAFFOLD:
@@ -1080,6 +1537,7 @@ if SCAFFOLD:
     sys.exit(0)
 
 print("\n=== CHANGES ===")
+patch, changed = [], []
 for root, dirs, files in os.walk(WORK):
     dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
     for f in sorted(files):
@@ -1090,12 +1548,24 @@ for root, dirs, files in os.walk(WORK):
         old_path = os.path.join(SRC, rel)
         with open(new_path) as fh:
             b = fh.read().splitlines()
+        a = []
         if os.path.exists(old_path):
             with open(old_path) as fh:
                 a = fh.read().splitlines()
-            d = list(difflib.unified_diff(a, b, f"before/{rel}", f"after/{rel}", lineterm=""))
-            if d:
-                print("\n".join(d))
-        else:
-            print(f"\n+++ NEW FILE: {rel}")
-            print("\n".join("+" + line for line in b))
+        d = list(difflib.unified_diff(a, b, f"a/{rel}" if a else "/dev/null",
+                                      f"b/{rel}", lineterm=""))
+        if d:
+            changed.append(rel)
+            patch += d
+            print("\n".join(d))
+
+# ---------------------------------------------------------------- save the result
+name = os.path.splitext(os.path.basename(os.path.normpath(CLI.repo or "repo")))[0]
+out_dir = CLI.out or os.path.join("agent_output", name + ("_fixed" if ok else "_review"))
+shutil.copytree(WORK, out_dir, dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", ".deps", ".venv", ".git"))
+with open(os.path.join(out_dir, "changes.patch"), "w") as fh:
+    fh.write("\n".join(patch) + "\n")
+print(f"\n=== RESULT SAVED TO: {os.path.abspath(out_dir)} ===")
+print("Modified/new files:", changed or "none")
+print("Patch (apply with `git apply` or `patch -p1`):", os.path.join(out_dir, "changes.patch"))
