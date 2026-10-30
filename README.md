@@ -64,7 +64,6 @@ Other safeguards: the agent works on a temporary copy of your repo and never tou
 - All reasoning and tool calling goes through Token Factory's OpenAI-compatible chat completions API (`https://api.tokenfactory.nebius.com/v1/`) with **Nemotron 3 Super** as the default model.
 - Nemotron is a reasoning model: reasoning tokens count against `max_tokens`. The agent sets a generous limit and, if a reply is cut off before the tool call is complete, asks the model to repeat it.
 - **Model routing (optional):** if `AGENT_ESCALATION_MODEL` is set (for example a larger Nemotron model), the agent switches to it after `STUCK_AFTER` iterations without progress and uses the smaller model for everything else. The benchmark below was run **without** escalation, with Nemotron 3 Super only.
-- Other Nebius tools: `TODO: list anything else the team used, or delete this line`.
 
 ## Quick start
 
