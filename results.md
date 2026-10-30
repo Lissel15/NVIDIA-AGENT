@@ -13,5 +13,5 @@
 | requests-url-header-bug | SUCCESS | YES | 46 | 827298 | 979 |
 | click-variadic-option-bug | REVIEW | YES | 60 | 797900 | 261 |
 | marshmallow-nested-schema-bug | SUCCESS | YES | 9 | 42476 | 95 |
-| tornado-async-ioloop-timeout | REVIEW | YES | 60 | 1175097 | 561 |
-| pytest-assert-rewrite-edgecase | SUCCESS | YES | 25 | 276722 | 171 |
+| sortedcontainers-bug | REVIEW | YES | 60 | 1175097 | 561 |
+| tabulate-edgecase| SUCCESS | YES | 25 | 276722 | 171 |
