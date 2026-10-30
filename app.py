@@ -11,6 +11,15 @@ EXAMPLES = sorted(
     key=lambda d: int(re.sub(r"\D", "", d) or 0),
 )
 
+try:
+    import spaces
+
+    @spaces.GPU
+    def _gpu_placeholder():
+        return None
+except ImportError:
+    pas
+
 
 def _need_key():
     return not os.environ.get("NEBIUS_API_KEY")

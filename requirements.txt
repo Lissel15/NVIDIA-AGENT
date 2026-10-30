@@ -2,4 +2,3 @@ gradio
 openai
 python-dotenv
 pytest
-spaces
