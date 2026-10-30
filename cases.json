@@ -12,6 +12,6 @@
   {"name": "requests-url-header-bug", "repo": "demo_repo_11", "feature": null},
   {"name": "click-variadic-option-bug", "repo": "demo_repo_12", "feature": null},
   {"name": "marshmallow-nested-schema-bug", "repo": "demo_repo_13", "feature": null},
-  {"name": "tornado-async-ioloop-timeout", "repo": "demo_repo_14", "feature": null},
-  {"name": "pytest-assert-rewrite-edgecase", "repo": "demo_repo_15", "feature": null}
+  {"name": "sortedcontainers-bug", "repo": "demo_repo_14", "feature": null},
+  {"name": "tabulate-edgecase", "repo": "demo_repo_15", "feature": null}
 ]
