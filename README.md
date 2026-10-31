@@ -164,13 +164,13 @@ python3 verify_fix.py agent_output/<name>_fixed
 
 It reads `changes.patch` and writes `verify_report.md` in that folder. It looks at three things:
 
-- Hardcoding: it warns if the patch adds an `if x == <value>` or uses a number copied from the test asserts (it skips 0, 1, 2 and `%` checks). A warning just means "look at this".
+- Hardcoding: it parses the changed code with `ast` and warns if the patch adds an `if x == <value>: return <value>`, or uses a value (number, list, dict) that the tests expect in their asserts. It skips very common values like 0, 1, 2. A warning just means "look at this".
 - Flaky tests: it runs the suite 3 times and says if the results change.
 - Extra tests: it asks a small model (Nemotron Nano) for 5 edge-case tests of the functions the patch changed, and runs them on the fixed code and on the original code. Tests that fail before the fix and pass after it are a good sign. The tests are written by a model, so check any failure by hand.
 
 Use `--no-model` to skip the extra tests (no tokens used). The model can be changed with the `VERIFY_MODEL` variable.
 
-It is a basic check. The hardcoding part only looks at numbers and comparisons, so some tricks will get through.
+It is a basic check, so some tricks (for example a hardcoded answer built with a calculation) will get through.
 
 ## Configuration (environment variables)
 

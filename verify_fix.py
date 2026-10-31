@@ -20,30 +20,120 @@ EXTRA_TESTS = 5
 MODEL = os.environ.get("VERIFY_MODEL", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B")
 
 
-def added_lines(patch_text):
-    # lines the patch added (skip the +++ header)
-    return [l[1:] for l in patch_text.splitlines()
-            if l.startswith("+") and not l.startswith("+++")]
+def touched_lines(patch_text):
+    # {file: line numbers (in the fixed file) that the patch added}
+    touched = {}
+    current = None
+    new_line = 0
+    for line in patch_text.splitlines():
+        if line.startswith("+++ b/"):
+            current = line[6:]
+            touched[current] = set()
+        elif line.startswith("@@"):
+            new_line = int(re.search(r"\+(\d+)", line).group(1))
+        elif current and line.startswith("+"):
+            touched[current].add(new_line)
+            new_line += 1
+        elif current and not line.startswith(("-", "\\")):
+            new_line += 1
+    return touched
 
 
-def test_numbers(folder):
-    # numbers on the right side of == in the test files
-    numbers = set()
-    for test_file in folder.glob("test_*.py"):
-        numbers.update(re.findall(r"==\s*(-?\d+(?:\.\d+)?)", test_file.read_text(encoding="utf-8")))
-    return {n for n in numbers if abs(float(n)) > COMMON_NUMBER_LIMIT}
+# ---- hardcoding check (uses ast) ----
+
+def literal(node):
+    # (True, value) if the node is a plain literal like 4, [1, 2] or "abc"
+    try:
+        return True, ast.literal_eval(node)
+    except Exception:
+        return False, None
+
+
+def norm(value):
+    # turns a value into a string so 4 and 4.0, or two equal lists, match
+    if isinstance(value, (list, tuple)):
+        return "seq:" + ",".join(norm(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return "set:" + ",".join(sorted(norm(v) for v in value))
+    if isinstance(value, dict):
+        return "map:" + ",".join(sorted(norm(k) + "=" + norm(v) for k, v in value.items()))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"num:{float(value)}"
+    return f"{type(value).__name__}:{value!r}"
+
+
+def interesting(value, in_return):
+    # skip values that show up in any code (0, 1, True, None, [], "a"...)
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return abs(value) > COMMON_NUMBER_LIMIT
+    if isinstance(value, str):
+        return in_return and len(value) >= 3
+    if isinstance(value, (list, tuple, set, frozenset, dict)):
+        return len(value) >= 2
+    return False
+
+
+def expected_values(folder):
+    # literals the tests compare against: assert x == 4, assertEqual(x, [1, 2])
+    values = set()
+    test_files = list(folder.rglob("test_*.py")) + list(folder.rglob("*_test.py"))
+    for test_file in test_files:
+        try:
+            tree = ast.parse(test_file.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            parts = []
+            if isinstance(node, ast.Compare) and any(isinstance(o, ast.Eq) for o in node.ops):
+                parts = [node.left, *node.comparators]
+            elif isinstance(node, ast.Call) and getattr(node.func, "attr", "") in ("assertEqual", "assertEquals"):
+                parts = node.args
+            for part in parts:
+                ok, value = literal(part)
+                if ok and interesting(value, True):
+                    values.add(norm(value))
+    return values
 
 
 def check_hardcoding(folder, patch_text):
+    expected = expected_values(folder)
     findings = []
-    numbers = test_numbers(folder)
-    for line in added_lines(patch_text):
-        # skip "x % 2 == 0" style checks
-        if re.search(r"\bif\b.*==\s*[\w\"'\[\(-]", line) and "%" not in line:
-            findings.append(f"compares against a fixed value: {line.strip()}")
-        for n in numbers:
-            if re.search(rf"(?<![\w.]){re.escape(n)}(?![\w.])", line):
-                findings.append(f"uses {n}, which is in a test assert: {line.strip()}")
+    for name, lines in touched_lines(patch_text).items():
+        path = folder / name
+        if not name.endswith(".py") or Path(name).name.startswith("test_") or not path.exists():
+            continue
+        source = path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        source_lines = source.splitlines()
+        returned = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Return) and n.value}
+        flagged = set()
+
+        def flag(node, why):
+            if node.lineno not in flagged:
+                flagged.add(node.lineno)
+                findings.append(f"{name}:{node.lineno} {why}: {source_lines[node.lineno - 1].strip()}")
+
+        for node in ast.walk(tree):
+            if getattr(node, "lineno", None) not in lines:
+                continue
+            # if x == <fixed value>: return <fixed value>
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Compare):
+                test = node.test
+                if len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq):
+                    ok, value = literal(test.comparators[0])
+                    returns_literal = any(isinstance(n, ast.Return) and n.value is not None
+                                          and literal(n.value)[0] for b in node.body for n in ast.walk(b))
+                    if ok and returns_literal and (interesting(value, False) or norm(value) in expected):
+                        flag(node, "returns a fixed value when the input equals a fixed value")
+            # a literal that is the same as one the tests expect
+            ok, value = literal(node) if isinstance(node, (ast.Constant, ast.List, ast.Tuple, ast.Dict, ast.Set, ast.UnaryOp)) else (False, None)
+            if ok and interesting(value, id(node) in returned) and norm(value) in expected:
+                flag(node, "uses a value that is in the test asserts")
     return findings
 
 
@@ -62,21 +152,7 @@ def run_tests_repeatedly(folder):
 def changed_functions(folder, patch_text):
     # source of the functions the patch touched, as {file: [source, ...]}
     result = {}
-    current = None
-    new_line = 0
-    touched = {}
-    for line in patch_text.splitlines():
-        if line.startswith("+++ b/"):
-            current = line[6:]
-            touched[current] = set()
-        elif line.startswith("@@"):
-            new_line = int(re.search(r"\+(\d+)", line).group(1))
-        elif current and line.startswith("+"):
-            touched[current].add(new_line)
-            new_line += 1
-        elif current and not line.startswith("-") and not line.startswith("\\"):
-            new_line += 1
-    for name, lines in touched.items():
+    for name, lines in touched_lines(patch_text).items():
         path = folder / name
         if not name.endswith(".py") or not path.exists() or Path(name).name.startswith("test_"):
             continue
@@ -119,7 +195,7 @@ def ask_model_for_tests(functions):
 def make_original(folder, patch_file, target):
     # copy of the folder with the patch undone
     shutil.copytree(folder, target, ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"))
-    r = subprocess.run(["git", "apply", "-R", "--unsafe-paths", str(patch_file)],
+    r = subprocess.run(["git", "apply", "-R", "--unsafe-paths", "--ignore-whitespace", str(patch_file)],
                        cwd=target, capture_output=True, text=True)
     return r.returncode == 0
 
