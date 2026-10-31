@@ -9,7 +9,7 @@ An autonomous coding agent that **fixes bugs, adds features, builds new projects
 Built for the **Nebius x NVIDIA Global AI Hackathon**, track: **Coding & Agentic Engineering**.
 
 - [Demo](https://huggingface.co/spaces/Mafer06Mo/bug-fixer-agent)
-- Video (3 min): `TODO: YouTube URL`
+- [Video](https://youtu.be/YyIQ13XqYus?si=V1V3ITkDOxLcMUl4)
 - License: MIT
 
 ## Table of contents
